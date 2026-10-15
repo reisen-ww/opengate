@@ -1348,6 +1348,28 @@ server.listen(Number(portStr), host, () => {
         console.log(`[catalog] 已就绪: ${JSON.stringify(snap)}`);
       })
   ).catch((e) => console.error("[catalog] 预热失败:", e?.message ?? e));
+
+  // 周期刷新模型清单：上游会上新/下架模型（实测 mimo 上线后旧列表里没有）。
+  // 委托模式拉 opencode 的 catalog；直连模式由插件的 catalog 自带周期刷新。
+  // refreshSeconds <=0 关闭。刷新成功后清能力缓存，让 /v1/models 立即反映新档位。
+  if (cfg.upstream === "delegate") {
+    const refreshMs = Math.max(0, Number(cfg.refreshSeconds ?? 300)) * 1000;
+    if (refreshMs > 0) {
+      let refreshing = false;
+      const timer = setInterval(() => {
+        if (refreshing || shuttingDown) return;
+        refreshing = true;
+        delegateCatalog(cfg)
+          .then(async (known) => {
+            capCache.clear();
+            console.log(`[catalog] 周期刷新完成: ${known.length} 个模型`);
+          })
+          .catch((e) => console.error("[catalog] 周期刷新失败:", e?.message ?? e))
+          .finally(() => { refreshing = false; });
+      }, refreshMs);
+      timer.unref?.();
+    }
+  }
 });
 
 // 优雅关闭：先停止接受新连接，等在途请求跑完（最多 10 秒）
