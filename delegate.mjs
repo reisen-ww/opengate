@@ -139,6 +139,83 @@ export class DelegateRuntime {
   #trimmer = null;
   #trimmerTimer = null;
   #childPid = null;
+  /** 流式增量订阅表：complete() 注册，结束后注销。 */
+  #deltaTaps = new Set();
+  /** partID → "text"|"reasoning"。delta 事件不带 part 类型，靠 part.updated 事件学习。 */
+  #partTypes = new Map();
+  /** partID → 信封剥离状态机（每个 text part 一个）。 */
+  #stripStates = new Map();
+
+  /**
+   * 信封感知的流式剥离器。
+   *
+   * 为什么需要：vendor 让模型用 StructuredOutput 返回
+   * `{"content":"答案","calls":[]}` 信封，最终结果由 vendor 解析剥离；
+   * 但事件流里的 text part 增量是**原始信封字面量**，直接转发会把
+   * `{"content":"` 前缀和 `"calls":[]}` 尾巴漏给客户端。
+   *
+   * 这里用一个小状态机流式剥离：识别信封头部后只放行 JSON 字符串
+   * 字面量内部的内容（处理 \uXXXX、\\" 等转义）；不符合信封形状的
+   * 头部（模型直接说人话时）原样放行。按 partID 各自维护状态，
+   * 并发请求互不串台。
+   */
+  #stripEnvelope(partID, delta) {
+    let st = this.#stripStates.get(partID);
+    if (!st) {
+      st = { buf: "", mode: "probing", esc: false, hex: 0, hexVal: 0, done: false };
+      // 状态表内存护栏：part 结束即删（part.updated 有 time.end 时），
+      // 超限兜底删最老
+      if (this.#stripStates.size > 200) this.#stripStates.delete(this.#stripStates.keys().next().value);
+      this.#stripStates.set(partID, st);
+    }
+    if (st.done) {
+      // 信封已收完（closing quote 已过）：吞掉剩余尾巴（", "calls":[...]}）
+      return "";
+    }
+
+    if (st.mode === "probing") {
+      st.buf += delta;
+      // 等到能判断是不是 {"content":" 开头
+      const HEAD = '{"content":"';
+      if (st.buf.length < HEAD.length) {
+        // 已经能确定不是信封（逐字符前缀失配）→ 整段原样放行
+        for (let i = 0; i < st.buf.length; i++) {
+          if (st.buf[i] !== HEAD[i]) { st.mode = "plain"; st.buf = ""; return delta; }
+        }
+        return ""; // 还在等待更多字节
+      }
+      if (st.buf.startsWith(HEAD)) {
+        st.mode = "instr"; st.buf = ""; return ""; // 进入字符串字面量，头部吞掉
+      }
+      st.mode = "plain"; st.buf = "";
+      return delta;
+    }
+
+    if (st.mode === "plain") return delta;
+
+    // mode === "instr"：在 JSON 字符串字面量内部，处理转义
+    let out = "";
+    for (const ch of delta) {
+      if (st.esc) {
+        if (st.hex > 0) {
+          st.hexVal = st.hexVal * 16 + Number.parseInt(ch, 16);
+          if (++st.hex === 4) { out += String.fromCharCode(st.hexVal); st.esc = false; st.hex = 0; st.hexVal = 0; }
+        } else if (ch === "u") { st.hex = 1; st.hexVal = 0; }
+        else { out += { n: "\n", t: "\t", r: "\r", b: "\b", f: "\f", '"': '"', "\\": "\\", "/": "/" }[ch] ?? ch; st.esc = false; }
+      } else if (ch === "\\") { st.esc = true; }
+      else if (ch === '"') { st.done = true; break; } // 信封 content 字符串结束
+      else { out += ch; }
+    }
+    return out;
+  }
+
+  /** 清理已结束 part 的剥离状态。 */
+  #gcStripState(wrapper) {
+    const ev = wrapper?.payload ?? wrapper;
+    if (ev?.type !== "message.part.updated") return;
+    const part = ev.properties?.part;
+    if (part?.id && part.time?.end && this.#stripStates.has(part.id)) this.#stripStates.delete(part.id);
+  }
 
   /**
    * @param {object} options
@@ -193,6 +270,16 @@ export class DelegateRuntime {
     this.#backend = this.#runtime.backend;
     this.#childPid = this.#runtime.child?.pid ?? null;
 
+    // 挂增量探针：vendor 的 handleEvent 只用事件做进度/工具跟踪，把文本增量丢了。
+    // 在它前面接一层，把 message.part.delta 转给流式订阅者（见 onTapDelta）。
+    const origHandleEvent = this.#backend.handleEvent.bind(this.#backend);
+    this.#backend.handleEvent = (wrapper) => {
+      this.#learnPartType(wrapper);
+      this.#gcStripState(wrapper);
+      this.#emitDelta(wrapper);
+      origHandleEvent(wrapper);
+    };
+
     this.#log(`[delegate] opencode 已就绪 pid=${this.#childPid} version=${this.#runtime.version} auth=${authState}`);
 
     // 启动内存回收定时器
@@ -219,6 +306,46 @@ export class DelegateRuntime {
     const models = await this.#backend.models();
     this.#catalog.replace(models);
     return models.length;
+  }
+
+  /**
+   * 注册流式增量订阅。返回注销函数。
+   * 回调收到 { type: "text"|"reasoning", text, sessionID }。
+   */
+  onTapDelta(fn) {
+    this.#deltaTaps.add(fn);
+    return () => this.#deltaTaps.delete(fn);
+  }
+
+  /** 从 part.updated 事件学习 partID 的类型（delta 事件只给 partID 不给类型）。 */
+  #learnPartType(wrapper) {
+    const ev = wrapper?.payload ?? wrapper;
+    if (ev?.type !== "message.part.updated") return;
+    const part = ev.properties?.part;
+    if (part?.id && (part.type === "text" || part.type === "reasoning")) {
+      if (this.#partTypes.size > 500) this.#partTypes.delete(this.#partTypes.keys().next().value);
+      this.#partTypes.set(part.id, part.type);
+    }
+  }
+
+  /** 把事件流的文本增量剥离信封后分发给订阅者。 */
+  #emitDelta(wrapper) {
+    if (!this.#deltaTaps.size) return;
+    const ev = wrapper?.payload ?? wrapper;
+    if (ev?.type !== "message.part.delta") return;
+    const p = ev.properties ?? {};
+    const delta = p.delta;
+    if (!delta) return;
+    // 类型判定：field="thinking" 直接算 reasoning；否则查 partID 学习表，缺省 text
+    const type = p.field === "thinking"
+      ? "reasoning"
+      : (this.#partTypes.get(p.partID) ?? "text");
+    // 信封剥离只作用于 text part（reasoning 是裸文本）
+    const clean = type === "text" ? this.#stripEnvelope(p.partID, delta) : delta;
+    if (!clean) return;
+    for (const fn of this.#deltaTaps) {
+      try { fn({ type, text: clean, sessionID: p.sessionID }); } catch { /* 订阅者异常不阻断其他 */ }
+    }
   }
 
   /**

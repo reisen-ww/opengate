@@ -494,6 +494,16 @@ async function runDelegated({ cfg, model, messages, tools, temperature, maxToken
   };
 
   let res;
+  // 流式增量：注册探针，把 opencode 事件流的文本增量实时转发给 onDelta。
+  // 只在客户端要 stream 时注册；非流式请求不注册（转发无意义）。
+  let offDelta = null;
+  const streamed = { text: 0, reasoning: 0 };
+  if (onDelta) {
+    offDelta = rt.onTapDelta((d) => {
+      if (streamed[d.type] !== undefined) streamed[d.type] += d.text.length;
+      onDelta(d);
+    });
+  }
   try {
     res = await rt.complete(body, signal);
   } catch (e) {
@@ -502,6 +512,8 @@ async function runDelegated({ cfg, model, messages, tools, temperature, maxToken
     err.code = e?.code ?? "upstream_error";
     err.effort = eff;
     throw err;
+  } finally {
+    offDelta?.();
   }
 
   const choice = res.result?.choices?.[0];
@@ -510,9 +522,12 @@ async function runDelegated({ cfg, model, messages, tools, temperature, maxToken
   const toolCalls = msg.tool_calls ?? [];
   const reasoning = msg.reasoning_content ?? msg.reasoning ?? "";
 
-  // 回放给调用方，保持与直连路径一致的增量语义
-  if (reasoning) onDelta?.({ type: "reasoning", text: reasoning });
-  if (text) onDelta?.({ type: "text", text });
+  // 收尾回放。注意：流式增量是 opencode 的原始 part 文本（可能带模型的结构化
+  // 尾巴），而 result.text 是 vendor 解析信封后的干净文本 —— 两者不是前缀关系，
+  // 不能按长度差补尾巴（会把信封字面量漏进正文）。所以规则很简单：
+  // 该类型流过增量就信任事件流不再补；一个增量都没收到（丢帧/非文本）才完整回放。
+  if (reasoning && streamed.reasoning === 0) onDelta?.({ type: "reasoning", text: reasoning });
+  if (text && streamed.text === 0) onDelta?.({ type: "text", text });
   toolCalls.forEach((tc, index) => onDelta?.({ type: "tool", toolCall: tc, index }));
 
   return {
