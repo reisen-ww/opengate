@@ -1,0 +1,14 @@
+{
+  "name": "opengate",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenAI + Anthropic compatible local gateway backed by OpenCode Zen free tier (delegates to a real opencode runtime)",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "models": "node diagnose-models.mjs",
+    "verify": "node verify.mjs",
+    "selftest": "node selftest.mjs"
+  }
+}

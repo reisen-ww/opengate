@@ -1,0 +1,16 @@
+# 运行时产物
+runtime-data/
+logs/
+bin/
+*.log
+
+# 本地配置：含自动生成的 apiKey，不要提交（首次启动会自动创建）
+config.json
+
+# 临时脚本
+_*.mjs
+_m*.mjs
+
+node_modules/
+.DS_Store
+Thumbs.db
