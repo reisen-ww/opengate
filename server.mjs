@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 
 import { loadPlugin, getCatalog, buildUpstreamRequest, fetchUpstream, iterateSSE, seedOf, modelEfforts, resolveEffort } from "./zen.mjs";
 import { DelegateRuntime } from "./delegate.mjs";
+import { rescueToolCalls } from "./toolcall-rescue.mjs";
 import { AvailabilityProbe } from "./probe.mjs";
 import {
   anthropicToOpenAI,
@@ -518,14 +519,28 @@ async function runDelegated({ cfg, model, messages, tools, temperature, maxToken
 
   const choice = res.result?.choices?.[0];
   const msg = choice?.message ?? {};
-  const text = msg.content ?? "";
-  const toolCalls = msg.tool_calls ?? [];
+  let text = msg.content ?? "";
+  let toolCalls = msg.tool_calls ?? [];
   const reasoning = msg.reasoning_content ?? msg.reasoning ?? "";
+
+  // 被动工具调用救援：免费小模型偶发不走 function_call 通道，把调用写成
+  // 文本（<tool_call>… / <function=…>）。三重门禁后才转换：
+  // 请求带 tools + 响应零 tool_calls + 解析出的工具名在请求 tools 白名单里。
+  // 流式路径文本可能已发出，救援结果主要供非流式与 finish_reason 语义修正。
+  if (!toolCalls.length && tools?.length && text) {
+    const rescued = rescueToolCalls(text, tools);
+    if (rescued) {
+      toolCalls = rescued.toolCalls;
+      text = rescued.text;
+      console.error(`[rescue] 文本工具调用已转换: ${toolCalls.map((t) => t.function.name).join(", ")} (model=${model})`);
+    }
+  }
 
   // 收尾回放。注意：流式增量是 opencode 的原始 part 文本（可能带模型的结构化
   // 尾巴），而 result.text 是 vendor 解析信封后的干净文本 —— 两者不是前缀关系，
   // 不能按长度差补尾巴（会把信封字面量漏进正文）。所以规则很简单：
   // 该类型流过增量就信任事件流不再补；一个增量都没收到（丢帧/非文本）才完整回放。
+  // 救援过的文本（流式路径）也不回放：客户端已见到原文，结果集仍携带转换后的 toolCalls。
   if (reasoning && streamed.reasoning === 0) onDelta?.({ type: "reasoning", text: reasoning });
   if (text && streamed.text === 0) onDelta?.({ type: "text", text });
   toolCalls.forEach((tc, index) => onDelta?.({ type: "tool", toolCall: tc, index }));
@@ -535,7 +550,7 @@ async function runDelegated({ cfg, model, messages, tools, temperature, maxToken
     text,
     reasoning,
     toolCalls,
-    finishReason: choice?.finish_reason ?? "stop",
+    finishReason: toolCalls.length ? "tool_calls" : (choice?.finish_reason ?? "stop"),
     usage: res.result?.usage ?? null,
     attempts: 1,
     effort: eff,
