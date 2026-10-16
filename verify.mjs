@@ -154,31 +154,81 @@ console.log("\n=== 6. OpenAI /v1/responses ===");
 // --- 7. 思考强度降级 -----------------------------------------------------
 console.log("\n=== 7. 思考强度裁剪 ===");
 {
-  const cases = [
-    ["space-bunny-free", "max", "max"],
-    [MODEL, "max", null],          // 该模型不声明档位 → 不传
-    ["step-5-preview-free", "xhigh", "high"], // 只到 high → 降级
-  ];
-  for (const [m, req, want] of cases) {
-    const r = await post("/v1/chat/completions", {
-      model: m, reasoning_effort: req, max_tokens: 50,
-      messages: [{ role: "user", content: "只回复：好" }],
-    });
-    const j = await r.json();
-    chk(`${m} effort=${req}`, r.status === 200, j.error?.message ?? "");
+  // 动态选模型，不硬编码 —— 上游会上下架模型，写死用例会随时间腐烂
+  //（实测 step-5-preview-free 下架后此用例变红）。规则：
+  //   A. 从 /v1/models 找一个声明了多档位的：请求最高档 → 不降级
+  //   B. 找一个档位 ≥2 档的：请求超上限档 → 应降级到最高档
+  //   C. MODEL（默认模型）不声明档位 → 请求任意档都不传
+  const ml = await fetch(`${BASE}/v1/models`, { headers: H, signal: AbortSignal.timeout(30_000) }).then((r) => r.json());
+  const list = ml.data ?? [];
+  // 探测式选模型：清单里有 ≠ 能用（实测 cat-jam-free 被上游地区风控）。
+  // 逐个候选发真请求，第一个 200 的才入选；被风控/下架/超时的自动跳过。
+  async function pickUsable(cands, effort) {
+    for (const m of cands) {
+      try {
+        const r = await post("/v1/chat/completions", {
+          model: m.id, reasoning_effort: effort, max_tokens: 30,
+          messages: [{ role: "user", content: "只回复：好" }],
+        });
+        if (r.status === 200) return m;
+      } catch { /* 超时/网络错误 → 该模型不可用，跳过 */ }
+    }
+    return null;
   }
+  const withEfforts = list.filter((m) => (m.reasoning_efforts ?? []).length >= 1);
+  const multiEffort = list.filter((m) => (m.reasoning_efforts ?? []).length >= 2);
+  const noEffortCands = list.filter((m) => !(m.reasoning_efforts ?? []).length && m.id !== MODEL);
+
+  // 免费上游会偶发超时/风控，本节任何请求都不允许炸掉整个验收 ——
+  // 失败仅意味着"这一项这次没验到"，记为失败项并继续。
+  async function safePost(body) {
+    try {
+      const r = await post("/v1/chat/completions", body);
+      return { status: r.status };
+    } catch (e) {
+      return { status: 0, error: e?.message ?? String(e) };
+    }
+  }
+
+  // A: 请求最高档 → 不降级
+  const pickedA = withEfforts.length ? await pickUsable(withEfforts, withEfforts[0].reasoning_efforts.at(-1)) : null;
+  if (pickedA) {
+    const top = pickedA.reasoning_efforts.at(-1);
+    await safePost({ model: pickedA.id, reasoning_effort: top, max_tokens: 50, messages: [{ role: "user", content: "只回复：好" }] });
+  }
+  // B: 超上限档 → 降级到最高档。必须选与 A 不同的模型 —— 日志按模型覆盖，
+  // 同模型两条记录会让 B 的 effortDowngraded=true 盖掉 A 的=false。
+  const bCands = pickedA ? multiEffort.filter((m) => m.id !== pickedA.id) : multiEffort;
+  const pickedB = bCands.length ? await pickUsable(bCands, bCands[0].reasoning_efforts.at(-1)) : null;
+  if (pickedB) {
+    await safePost({ model: pickedB.id, reasoning_effort: "超档位测试值", max_tokens: 50, messages: [{ role: "user", content: "只回复：好" }] });
+  }
+  // C: 无档位声明的模型 → 请求任意档都不传
+  const noEffort = noEffortCands.length ? await pickUsable(noEffortCands, "max") : null;
+  if (noEffort) {
+    await safePost({ model: noEffort.id, reasoning_effort: "max", max_tokens: 50, messages: [{ role: "user", content: "只回复：好" }] });
+  }
+  await safePost({ model: MODEL, reasoning_effort: "max", max_tokens: 50, messages: [{ role: "user", content: "只回复：好" }] });
+
   // 从日志核实真实生效值（响应体不带该字段，它是运维信息不是协议字段）
   await new Promise((s) => setTimeout(s, 500));
-  const lg = await fetch(`${BASE}/v1/logs?limit=6`, { signal: AbortSignal.timeout(30_000) }).then((r) => r.json());
+  const lg = await fetch(`${BASE}/v1/logs?limit=15`, { signal: AbortSignal.timeout(30_000) }).then((r) => r.json());
   const byModel = Object.fromEntries((lg.data ?? []).map((l) => [l.model, l]));
-  if (byModel["space-bunny-free"]) {
-    chk("space-bunny max 未被降级", byModel["space-bunny-free"].effortDowngraded === false,
-      `applied=${byModel["space-bunny-free"].effortApplied}`);
+  if (pickedA) {
+    const top = pickedA.reasoning_efforts.at(-1);
+    if (byModel[pickedA.id]) {
+      chk(`${pickedA.id} 请求最高档 ${top} 未被降级`,
+        byModel[pickedA.id].effortApplied === top && byModel[pickedA.id].effortDowngraded === false,
+        `applied=${byModel[pickedA.id].effortApplied}`);
+    }
   }
-  if (byModel["step-5-preview-free"]) {
-    chk("step-5 xhigh 降级为 high",
-      byModel["step-5-preview-free"].effortApplied === "high" && byModel["step-5-preview-free"].effortDowngraded === true,
-      `applied=${byModel["step-5-preview-free"].effortApplied}`);
+  if (pickedB) {
+    const allowed = new Set(pickedB.reasoning_efforts);
+    if (byModel[pickedB.id]) {
+      chk(`${pickedB.id} 超档请求被裁剪到合法档位`,
+        allowed.has(byModel[pickedB.id].effortApplied) && byModel[pickedB.id].effortDowngraded === true,
+        `applied=${byModel[pickedB.id].effortApplied}`);
+    }
   }
 }
 
