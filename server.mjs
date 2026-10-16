@@ -400,10 +400,13 @@ function getDelegate(cfg) {
 }
 
 /** 委托模式下已就绪的模型清单（含不可用项，供 effort 查询）。 */
-async function delegateCatalog(cfg) {
+async function delegateCatalog(cfg, { forceRefresh = false } = {}) {
   const rt = getDelegate(cfg);
   await rt.start();
-  if (!rt.catalog.all().length) await rt.refresh();
+  // 冷启动必刷；周期刷新走 forceRefresh —— 之前这里写成"非空就不刷"，
+  // 定时器每轮只是读旧缓存还打"刷新完成"日志，上游上新模型永远看不到。
+  // backend.models() 拉到空列表会自己抛错并保留现有列表，安全。
+  if (forceRefresh || !rt.catalog.all().length) await rt.refresh();
   return rt.catalog.all();
 }
 
@@ -1386,13 +1389,27 @@ server.listen(Number(portStr), host, () => {
     const refreshMs = Math.max(0, Number(cfg.refreshSeconds ?? 300)) * 1000;
     if (refreshMs > 0) {
       let refreshing = false;
+      let lastIds = null;
       const timer = setInterval(() => {
         if (refreshing || shuttingDown) return;
         refreshing = true;
-        delegateCatalog(cfg)
+        delegateCatalog(cfg, { forceRefresh: true })
           .then(async (known) => {
             capCache.clear();
-            console.log(`[catalog] 周期刷新完成: ${known.length} 个模型`);
+            // 只在清单真的变化时才刷日志（防刷屏），变化明细直接可见
+            const ids = known.map((m) => m.id).sort().join(",");
+            if (lastIds === null) {
+              console.log(`[catalog] 周期刷新基线: ${known.length} 个模型`);
+            } else if (ids !== lastIds) {
+              const prev = new Set(lastIds.split(","));
+              const cur = new Set(ids.split(","));
+              const added = [...cur].filter((x) => !prev.has(x));
+              const removed = [...prev].filter((x) => !cur.has(x));
+              console.log(`[catalog] 模型清单变化: +${added.length ? added.join(",") : "无"}  -${removed.length ? removed.join(",") : "无"}  （现共 ${known.length} 个）`);
+            } else {
+              console.log(`[catalog] 周期刷新: 无变化 (${known.length} 个)`);
+            }
+            lastIds = ids;
           })
           .catch((e) => console.error("[catalog] 周期刷新失败:", e?.message ?? e))
           .finally(() => { refreshing = false; });
