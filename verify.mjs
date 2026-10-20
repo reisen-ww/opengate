@@ -163,12 +163,15 @@ console.log("\n=== 7. 思考强度裁剪 ===");
   const list = ml.data ?? [];
   // 探测式选模型：清单里有 ≠ 能用（实测 cat-jam-free 被上游地区风控）。
   // 逐个候选发真请求，第一个 200 的才入选；被风控/下架/超时的自动跳过。
+  // 探测用 30s 短超时（post() 是 300s）：风控挂起期每个坏候选会挂满超时，
+  // 全部候选最坏要 20+ 分钟（审查 minor）。
   async function pickUsable(cands, effort) {
     for (const m of cands) {
       try {
-        const r = await post("/v1/chat/completions", {
-          model: m.id, reasoning_effort: effort, max_tokens: 30,
-          messages: [{ role: "user", content: "只回复：好" }],
+        const r = await fetch(`${BASE}/v1/chat/completions`, {
+          method: "POST", headers: H,
+          body: JSON.stringify({ model: m.id, reasoning_effort: effort, max_tokens: 30, messages: [{ role: "user", content: "只回复：好" }] }),
+          signal: AbortSignal.timeout(30_000),
         });
         if (r.status === 200) return m;
       } catch { /* 超时/网络错误 → 该模型不可用，跳过 */ }
@@ -206,9 +209,11 @@ console.log("\n=== 7. 思考强度裁剪 ===");
   // C: 无档位声明的模型 → 请求任意档都不传
   const noEffort = noEffortCands.length ? await pickUsable(noEffortCands, "max") : null;
   if (noEffort) {
-    await safePost({ model: noEffort.id, reasoning_effort: "max", max_tokens: 50, messages: [{ role: "user", content: "只回复：好" }] });
+    const rC = await safePost({ model: noEffort.id, reasoning_effort: "max", max_tokens: 50, messages: [{ role: "user", content: "只回复：好" }] });
+    chk(`${noEffort.id} effort=max 可接受`, rC.status === 200, rC.status ? `status=${rC.status}` : "本次未验到(请求异常)");
   }
-  await safePost({ model: MODEL, reasoning_effort: "max", max_tokens: 50, messages: [{ role: "user", content: "只回复：好" }] });
+  const rM = await safePost({ model: MODEL, reasoning_effort: "max", max_tokens: 50, messages: [{ role: "user", content: "只回复：好" }] });
+  chk(`${MODEL} effort=max 可接受`, rM.status === 200, rM.status ? `status=${rM.status}` : "本次未验到(请求异常)");
 
   // 从日志核实真实生效值（响应体不带该字段，它是运维信息不是协议字段）
   await new Promise((s) => setTimeout(s, 500));

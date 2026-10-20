@@ -45,7 +45,10 @@ const VERSION = "1.1.0";
 async function loadConfig() {
   let cfg = {};
   if (existsSync(CONFIG_PATH)) {
-    cfg = JSON.parse(await readFile(CONFIG_PATH, "utf8"));
+    // 剥 BOM：PS 5.1 的 Set-Content -Encoding UTF8 会写 BOM，JSON.parse 遇 BOM 直接崩
+    //（2026-10-21 巡检实锤：网关启动即挂，watchdog 无限重启循环）
+    const raw = (await readFile(CONFIG_PATH, "utf8")).replace(/^\uFEFF/, "");
+    cfg = JSON.parse(raw);
   }
   // 首次运行生成随机本地 key（用户要求：生成本地 key）
   if (!cfg.apiKey) {
@@ -508,12 +511,17 @@ async function runDelegated({ cfg, model, messages, tools, temperature, maxToken
       onDelta(d);
     });
   }
+  // 端到端兜底超时：上游（Zen 免费层风控时）可能静默挂起不返回任何事件，
+  // 没有超时的话槽位被永久占死，整个网关 429 瘫痪（2026-10-20 巡检实锤）。
+  // 必须声明在 try 外：catch 里的 504 消息要引用它（审查 blocker）；
+  // 非有限值（NaN/字符串）兜底默认 600s，防 AbortSignal.timeout(NaN) 抛 RangeError。
+  const rawTimeout = Number(cfg.delegateTimeoutMs ?? 600_000);
+  const timeoutMs = Number.isFinite(rawTimeout) ? Math.max(30_000, rawTimeout) : 600_000;
+  // 单独持有兜底 signal：vendor 会把 abort 包装成普通错误（丢失 TimeoutError 身份），
+  // 判定只能看它本身是否触发，不能猜 e.name
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
   try {
-    // 端到端兜底超时：上游（Zen 免费层风控时）可能静默挂起不返回任何事件，
-    // 没有超时的话槽位被永久占死，整个网关 429 瘫痪（2026-10-20 巡检实锤）。
-    // 超时释放槽位并返回 504，客户端断开 signal 也一并组合。
-    const timeoutMs = Math.max(30_000, Number(cfg.delegateTimeoutMs ?? 600_000));
-    const signals = [signal, AbortSignal.timeout(timeoutMs)].filter(Boolean);
+    const signals = [signal, timeoutSignal].filter(Boolean);
     const wireSignal = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
     res = await rt.complete(body, wireSignal);
   } catch (e) {
@@ -521,7 +529,7 @@ async function runDelegated({ cfg, model, messages, tools, temperature, maxToken
     err.status = e?.status ?? 502;
     err.code = e?.code ?? "upstream_error";
     err.effort = eff;
-    if (e?.name === "TimeoutError" || (e?.name === "AbortError" && !signal?.aborted)) {
+    if (timeoutSignal.aborted && !signal?.aborted) {
       err.status = 504;
       err.code = "delegate_timeout";
       err.message = `上游委托请求超过 ${Math.round(timeoutMs / 1000)}s 无响应，已中止以释放并发槽位（上游疑似风控挂起）`;
