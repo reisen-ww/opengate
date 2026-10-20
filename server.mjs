@@ -509,12 +509,24 @@ async function runDelegated({ cfg, model, messages, tools, temperature, maxToken
     });
   }
   try {
-    res = await rt.complete(body, signal);
+    // 端到端兜底超时：上游（Zen 免费层风控时）可能静默挂起不返回任何事件，
+    // 没有超时的话槽位被永久占死，整个网关 429 瘫痪（2026-10-20 巡检实锤）。
+    // 超时释放槽位并返回 504，客户端断开 signal 也一并组合。
+    const timeoutMs = Math.max(30_000, Number(cfg.delegateTimeoutMs ?? 600_000));
+    const signals = [signal, AbortSignal.timeout(timeoutMs)].filter(Boolean);
+    const wireSignal = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+    res = await rt.complete(body, wireSignal);
   } catch (e) {
     const err = new Error(e?.message ?? String(e));
     err.status = e?.status ?? 502;
     err.code = e?.code ?? "upstream_error";
     err.effort = eff;
+    if (e?.name === "TimeoutError" || (e?.name === "AbortError" && !signal?.aborted)) {
+      err.status = 504;
+      err.code = "delegate_timeout";
+      err.message = `上游委托请求超过 ${Math.round(timeoutMs / 1000)}s 无响应，已中止以释放并发槽位（上游疑似风控挂起）`;
+      console.error(`[delegate] 请求超时被中止 (model=${model})，上游疑似挂起`);
+    }
     throw err;
   } finally {
     offDelta?.();
