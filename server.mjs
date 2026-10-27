@@ -22,7 +22,6 @@ import { fileURLToPath } from "node:url";
 
 import { loadPlugin, getCatalog, buildUpstreamRequest, fetchUpstream, iterateSSE, seedOf, modelEfforts, resolveEffort } from "./zen.mjs";
 import { DelegateRuntime } from "./delegate.mjs";
-import { shouldFallback, runDeepSeekFallback } from "./fallback.mjs";
 import { rescueToolCalls } from "./toolcall-rescue.mjs";
 import { AvailabilityProbe } from "./probe.mjs";
 import {
@@ -381,17 +380,7 @@ async function runUpstream({ cfg, model, messages, tools, temperature, maxTokens
 
   try {
     if (cfg.upstream === "delegate") {
-      try {
-        return await runDelegated({ cfg, model, messages, tools, temperature, maxTokens, topP, eff, reasoningEffort, onDelta, signal });
-      } catch (e) {
-        // 免费层失败的有偿兜底：仅在风控挂起/上游 5xx/429 时切 DeepSeek 官方 API
-        //（花真钱，QUEUE_FULL 和客户端取消不触发，见 fallback.mjs）。默认开启。
-        if (cfg.fallback?.enabled !== false && shouldFallback(e, { signal })) {
-          console.error(`[fallback] 免费层失败(${e.code ?? e.status ?? "?"})，尝试 DeepSeek 兜底 (model=${model})`);
-          return await runDeepSeekFallback({ cfg, model, messages, tools, temperature, maxTokens, topP, eff, onDelta, signal });
-        }
-        throw e;
-      }
+      return await runDelegated({ cfg, model, messages, tools, temperature, maxTokens, topP, eff, reasoningEffort, onDelta, signal });
     }
     return await runUpstreamInner({ cfg, model, messages, tools, temperature, maxTokens, topP, seed, maxAttempts, baseDelay, eff, reasoningEffort, onDelta, signal });
   } finally {
