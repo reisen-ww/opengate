@@ -77,7 +77,9 @@ const FORWARDED_ENV = [
 const XDG_ROOTS = ['config', 'data', 'cache', 'state']
 
 async function binaryVersion(file) {
-  const { stdout } = await exec(file, ['--version'], { timeout: 15000, windowsHide: true })
+  // 45s：Defender 对这个 ~100MB 二进制的冷实时扫描可超过 15s，导致
+  // 计划任务自愈冷启动时 catalog 预热间歇性失败（2026-10-31 实测）。
+  const { stdout } = await exec(file, ['--version'], { timeout: 45000, windowsHide: true })
   return stdout.trim()
 }
 

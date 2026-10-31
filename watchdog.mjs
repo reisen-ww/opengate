@@ -88,6 +88,14 @@ class Logger {
   }
 }
 
+const listen = await readListen();
+const [listenHost, listenPort] = listen.split(":");
+const probeHost = listenHost === "0.0.0.0" || listenHost === "::" ? "127.0.0.1" : listenHost;
+
+// 单实例保护（幂等自愈入口）：已有实例在跑就静默退出——
+// 计划任务每 10 分钟拉起本进程时不刷日志、不叠实例。
+if (await portBusy(probeHost, Number(listenPort))) process.exit(0);
+
 mkdirSync(LOG_DIR, { recursive: true });
 const log = new Logger(LOG_FILE);
 
@@ -123,16 +131,6 @@ function portBusy(host, port) {
     s.once("error", () => done(false));
     s.setTimeout(1500, () => done(false));
   });
-}
-
-const listen = await readListen();
-const [listenHost, listenPort] = listen.split(":");
-const probeHost = listenHost === "0.0.0.0" || listenHost === "::" ? "127.0.0.1" : listenHost;
-
-// 单实例保护：避免"手动启动的实例 + 开机自启的实例"互相打架
-if (await portBusy(probeHost, Number(listenPort))) {
-  log.line(`[跳过] ${probeHost}:${listenPort} 已被占用 —— 已有实例在运行，守护进程退出`);
-  process.exit(0);
 }
 
 let child = null;
